@@ -243,9 +243,21 @@ cd UUyc-companion && SIGN_IDENTITY=- scripts/build-app.sh
 
 生成的 App 在 `build/UUyc companion.app`。加上 `--install` 参数会安装到「应用程序」文件夹并打开。
 
+显示恢复回归测试：`CODEX_TASK_DATA_DIR=<任务目录> zsh scripts/test-display-recovery.sh`。
+测试只读取当前显示器模式，验证快照、模式匹配、恢复记录和连接事件；不会创建虚拟屏或改变显示配置。
+实际连接、断开、异常退出和跨重启后的模式恢复仍需实机验收。
+
+恢复使用每次连接前的物理屏配置（逻辑/像素尺寸、模式、刷新率、布局和镜像关系），按显示器 UUID 匹配，不使用固定分辨率。
+缺席屏的记录保留到重新接入；恢复失败保留记录并停止自动重试。旧版本只保存布局，无法从旧记录还原未记录的模式或刷新率。
+
+虚拟屏在线且活动时，即使系统暂未提供模式元数据也会保留；此时状态显示「模式未确认」，物理屏保持开启。
+只有逻辑尺寸、像素尺寸及桌面可用性均通过核验，才会按设置关闭物理屏；HiDPI 勾选本身不作为实际启用的证据。
+
 - `SIGN_IDENTITY=-` 表示用 ad-hoc 签名。缺点是每次重新构建后，系统授权都会失效，需要重新授权。如果你有自己的代码签名证书，把 `-` 换成证书名称，升级后授权就能保留
 - 只装了命令行工具（没有完整 Xcode）也能构建：内置的 PermissionFlow 和 TourKit 已经把需要 Xcode 宏插件的写法改掉了，详见各自目录下的 `VENDORED.md`
-- 「关于」窗口依赖作者的私有模块 AboutKit，目前只有作者本人能从源码完整构建；直接下载 Releases 里的安装包即可正常使用
+- 「关于」窗口和 Debug 编号由项目内实现提供；依赖均已内置，构建无需访问私有仓库
+- 可用 `SWIFT_BUILD_PATH` 指定编译缓存目录、`APP_OUTPUT_DIR` 指定 App 输出目录；不加 `--install` 只构建和签名
+- 关于窗口与 Debug 编号回归：`CODEX_TASK_DATA_DIR=<任务目录> scripts/test-about.sh`，在独立测试进程中检查，不启动显示管理或远程连接
 
 <details>
 <summary><b>工作原理</b></summary>

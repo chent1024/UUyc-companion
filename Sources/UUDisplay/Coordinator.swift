@@ -3,9 +3,13 @@
 import AppKit
 
 final class Coordinator {
-    let monitor = UUMonitor()
-    let display = DisplayManager()
-    private let store = ConfigStore.shared
+    let monitor: UUMonitor
+    let display: DisplayManager
+    private let store: ConfigStore
+
+    init(monitor: UUMonitor = UUMonitor(), display: DisplayManager = DisplayManager(), store: ConfigStore = .shared) {
+        self.monitor = monitor; self.display = display; self.store = store
+    }
 
     /// 状态变化时通知菜单栏刷新
     var onChange: (() -> Void)?
@@ -25,6 +29,8 @@ final class Coordinator {
         display.recoverIfNeeded()
         monitor.onConnect = { [weak self] in self?.handleConnect() }
         monitor.onDisconnect = { [weak self] in self?.handleDisconnect() }
+        monitor.onIdle = { [weak self] in self?.display.observeIdleDisplays() }
+        display.observeIdleDisplays()
         monitor.start()
     }
 
@@ -34,12 +40,13 @@ final class Coordinator {
     }
 
     var statusText: String {
-        if display.wedged { return "⛔️ 屏幕设置无响应，请重启 Mac" }
+        if display.wedged { return "⛔️ 显示事务失败，已停止自动调整，请检查恢复记录" }
+        if display.recoveryFailed { return "⚠️ 显示恢复未完成，记录已保留，请手动恢复" }
         if store.config.paused { return "虚拟屏已暂停：连接时不做调整" }
         guard connected else { return "等待其它设备连接中" }
         let who = controllerName ?? "未知设备"
-        if let c = display.current, display.isActive {
-            return "\(who) 已连接 · 虚拟屏已匹配 \(c.sizeLabel)\(display.physicalOff ? " · 物理屏幕已软关闭" : "")"
+        if display.current != nil, display.isActive {
+            return "\(who) 已连接 · \(display.virtualStatusText)"
         }
         return "\(who) 已连接 · 虚拟屏没有调整"
     }
@@ -47,6 +54,9 @@ final class Coordinator {
     // MARK: - 事件
 
     func handleConnect() {
+        namePoll?.invalidate()
+        namePoll = nil
+        display.beginSession()
         connectedAt = Date()
         controllerName = nil
         openedUUWindow = false
@@ -77,21 +87,19 @@ final class Coordinator {
             resolve(name)
             return true
         }
-        if elapsed >= 30 {
-            Log.info("30 秒内未读到控制端名称，停止等待")
-            return true
-        }
+        // UU 页面或窗口可在连接期间才出现；连接结束/暂停才停止，不猜测上次设备。
+        if elapsed >= 30 { connectedAt = Date(); Log.info("尚未读到控制端名称，连接期间继续等待") }
         return false
     }
 
     private func readControllerName() -> String? {
         guard UUReader.isTrusted else { return nil }
-        switch UUReader.readControllers() {
+        switch monitor.currentControllers {
         case .none:
-            // 主窗口没开：打开一次 UU 主界面再读
+            // 未获得可用快照：只尝试展开一次窗口，不能把缓存缺失当成窗口不存在。
             if !openedUUWindow {
                 openedUUWindow = true
-                Log.info("UU 主窗口未打开，尝试打开以读取控制端名称")
+                Log.info("尚无可用的控制端读取结果，尝试展开 UU 主界面")
                 UUReader.showMainWindow()
             }
             return nil
@@ -119,7 +127,7 @@ final class Coordinator {
     private func apply(_ cfg: DeviceConfig?) {
         defer { onChange?() }
         guard let cfg, cfg.kind != .computer, cfg.hasSize else {
-            if display.isActive { display.remove() }
+            display.remove()
             Log.info(cfg == nil ? "无可用配置，不切换" : "「\(cfg!.name)」不指定分辨率或还没填写，不切换")
             return
         }

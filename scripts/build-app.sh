@@ -10,7 +10,8 @@ cd "$(dirname "$0")/.."
 
 VERSION="1.1.3"
 APP_NAME="UUyc companion"
-APP="build/$APP_NAME.app"
+APP="${APP_OUTPUT_DIR:-build}/$APP_NAME.app"
+SWIFT_BUILD_PATH="${SWIFT_BUILD_PATH:-.build}"
 LEGACY_APP="/Applications/UUDisplay.app"   # 改名前的安装位置
 SIGN_IDENTITY="${SIGN_IDENTITY:-UUDisplay Signing}"
 
@@ -20,8 +21,8 @@ if [[ "$SIGN_IDENTITY" != "-" ]] && ! security find-identity -v -p codesigning |
   exit 1
 fi
 
-swift build -c release --build-system native --product UUDisplay
-BIN="$(swift build -c release --build-system native --show-bin-path)/UUDisplay"
+swift build -c release --build-system native --scratch-path "$SWIFT_BUILD_PATH" --product UUDisplay
+BIN="$(swift build -c release --build-system native --scratch-path "$SWIFT_BUILD_PATH" --show-bin-path)/UUDisplay"
 
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -30,8 +31,6 @@ cp "$BIN" "$APP/Contents/MacOS/UUDisplay"
 cp "$BIN" "$APP/Contents/MacOS/UUDisplayWatchdog"
 # PermissionFlow 资源包（本地化文案等），放 Contents/Resources 供 PermissionFlowResources 查找
 cp -R "$(dirname "$BIN")/PermissionFlow_PermissionFlow.bundle" "$APP/Contents/Resources/"
-# AboutKit 资源包（作者头像），放 Contents/Resources
-cp -R "$(dirname "$BIN")/AboutKit_AboutKit.bundle" "$APP/Contents/Resources/"
 # 功能导览配图（TourKit 从 Bundle.main 的 Resources 根目录按文件名查找）
 cp Assets/Tour/*.png "$APP/Contents/Resources/"
 # App 图标与菜单栏模板图（见 Assets/AppIcon/README.md）

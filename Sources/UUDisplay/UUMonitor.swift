@@ -5,6 +5,7 @@ import Foundation
 final class UUMonitor {
     var onConnect: (() -> Void)?
     var onDisconnect: (() -> Void)?
+    var onIdle: (() -> Void)?
     private(set) var connected = false
 
     private var timer: Timer?
@@ -13,6 +14,11 @@ final class UUMonitor {
     private var readInFlight = false
     private var controllers: [String]?
     private var controllersReadAt = Date.distantPast
+
+    /// Coordinator 复用同一份后台读取结果，避免主线程再次遍历 AX 树。
+    var currentControllers: [String]? {
+        Date().timeIntervalSince(controllersReadAt) <= 1 ? controllers : nil
+    }
 
     private let trusted: () -> Bool
     private let readControllers: () -> [String]?
@@ -44,8 +50,7 @@ final class UUMonitor {
             return
         }
         // 每次 tick 仍检测覆盖窗口；AX 卡顿不能阻塞原来的检测路径。
-        let fresh = Date().timeIntervalSince(controllersReadAt) <= 1
-        apply(controllers: fresh ? controllers : nil)
+        apply(controllers: currentControllers)
         // AX 调用可能阻塞；后台串行读取且不堆积任务。
         guard !readInFlight else { return }
         readInFlight = true
@@ -78,7 +83,7 @@ final class UUMonitor {
             Log.info("检测到 UU 断开")
             onDisconnect?()
         case nil:
-            break
+            if !connected { onIdle?() }
         }
     }
 }

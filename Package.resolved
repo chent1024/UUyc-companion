@@ -1,14 +1,4 @@
 {
-  "pins" : [
-    {
-      "identity" : "aboutkit",
-      "kind" : "remoteSourceControl",
-      "location" : "https://github.com/aoyamashou/AboutKit.git",
-      "state" : {
-        "revision" : "10ab96dc903324b6fd14ef9427d4a4f561385607",
-        "version" : "3.0.0"
-      }
-    }
-  ],
+  "pins" : [],
   "version" : 2
 }

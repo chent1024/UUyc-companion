@@ -108,7 +108,7 @@ final class SettingsModel: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.refresh() }
     }
 
-    func showAbout() { AboutPage.show() }
+    @MainActor func showAbout() { AboutPage.show() }
 
     /// 完全退出：停掉本次登录中的看门狗（不卸载，下次打开 App 或重新登录时恢复），再退出主程序
     func quitCompletely() {

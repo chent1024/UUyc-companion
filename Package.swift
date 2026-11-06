@@ -9,8 +9,6 @@ let package = Package(
         .package(path: "Vendor/PermissionFlow"),
         // 首次启动功能导览（MIT，内置副本见 Vendor/TourKit/VENDORED.md）
         .package(path: "Vendor/TourKit"),
-        // 「关于」窗口与 Debug 编号（作者自己的公用模块）
-        .package(url: "https://github.com/aoyamashou/AboutKit.git", from: "3.0.0"),
     ],
     targets: [
         .target(name: "CGVirtualDisplayBridge"),
@@ -22,7 +20,6 @@ let package = Package(
             .product(name: "PermissionFlow", package: "PermissionFlow"),
             .product(name: "SystemSettingsKit", package: "PermissionFlow"),
             .product(name: "TourKit", package: "TourKit"),
-            .product(name: "AboutKit", package: "AboutKit"),
         ]),
         .executableTarget(name: "dispoff", dependencies: ["CGVirtualDisplayBridge"]),
     ]

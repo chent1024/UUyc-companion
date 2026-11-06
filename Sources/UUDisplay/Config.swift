@@ -63,7 +63,7 @@ final class ConfigStore {
 
     static let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("UUDisplay", isDirectory: true)
-    private let url = ConfigStore.dir.appendingPathComponent("config.json")
+    private let url: URL
 
     var config: AppConfig {
         didSet { save() }
@@ -71,8 +71,9 @@ final class ConfigStore {
 
     var isConfigured: Bool { !config.devices.isEmpty }
 
-    private init() {
-        try? FileManager.default.createDirectory(at: ConfigStore.dir, withIntermediateDirectories: true)
+    init(dir: URL = ConfigStore.dir) {
+        url = dir.appendingPathComponent("config.json")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         config = (try? JSONDecoder().decode(AppConfig.self, from: Data(contentsOf: url))) ?? AppConfig()
     }
 

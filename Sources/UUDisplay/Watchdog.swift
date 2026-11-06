@@ -42,10 +42,13 @@ enum Watchdog {
         try? FileManager.default.createDirectory(at: ConfigStore.dir, withIntermediateDirectories: true)
         Log.info("[看门狗] 启动 pid=\(getpid())")
         var uuGoneSince: Date?
+        var recoveryAttempts = 0
         while true {
             autoreleasepool {
                 Heartbeat.beat(Heartbeat.watchdogURL)
-                guard PhysicalDisplays.pending != nil else { uuGoneSince = nil; return }
+                let physicalPending = PhysicalDisplays.pending != nil
+                let sessionPending = FileManager.default.fileExists(atPath: DisplaySession.url.path)
+                guard physicalPending || sessionPending else { uuGoneSince = nil; recoveryAttempts = 0; return }
 
                 let hb = Heartbeat.read(Heartbeat.appURL)
                 let appExists = hb.map { kill($0.pid, 0) == 0 } ?? false
@@ -57,11 +60,30 @@ enum Watchdog {
                 if !appHealthy {
                     if appExists, let pid = hb?.pid {
                         Log.info("[看门狗] 主程序心跳超时 \(Int(hb?.age ?? 0)) 秒，强制结束 pid=\(pid)")
-                        kill(pid, SIGKILL)
+                        // 等待进程退出及虚拟屏移除稳定后，再进入下一轮恢复。
+                        if kill(pid, SIGKILL) == 0 { return }
                     }
-                    PhysicalDisplays.restore(reason: "看门狗：主程序\(appExists ? "卡死" : "不在")")
+                    guard recoveryAttempts < 3 else { return }
+                    recoveryAttempts += 1
+                    if physicalPending {
+                        // 启用后至少等一个检查间隔，不能在热插拔未稳定时紧接着改模式。
+                        if PhysicalDisplays.restore(reason: "看门狗：主程序\(appExists ? "卡死" : "不在")") {
+                            recoveryAttempts = 0
+                        }
+                    } else if let session = try? DisplaySession.load() {
+                        let err = session.restore()
+                        if err == .success, session.verified() {
+                            PhysicalDisplays.clearResolvedRecord()
+                            do {
+                                if let offline = session.offline() { try offline.save() }
+                                else { try FileManager.default.removeItem(at: DisplaySession.url) }
+                            } catch { Log.info("[看门狗] 恢复记录保留：\(error)") }
+                        }
+                    }
                 } else if let t = uuGoneSince, Date().timeIntervalSince(t) > uuGoneLimit {
                     PhysicalDisplays.restore(reason: "看门狗：UU 已断开但物理屏未恢复")
+                } else {
+                    recoveryAttempts = 0
                 }
             }
             Thread.sleep(forTimeInterval: interval)
