@@ -9,6 +9,8 @@ TEST_DIR="$(mktemp -d "$CODEX_TASK_DATA_DIR/UUyc-companion/tests/display-recover
 trap 'rm -rf "$TEST_DIR"' EXIT
 export TMPDIR="$TEST_DIR"
 scripts/test-connection.sh
+swiftc Sources/UUDisplay/WorkWindowSession.swift tests/work-windows-main.swift -o "$TEST_DIR/window-tests"
+"$TEST_DIR/window-tests"
 swiftc Sources/UUDisplay/Config.swift Sources/UUDisplay/Log.swift \
   Sources/UUDisplay/DisplaySession.swift Sources/UUDisplay/PhysicalDisplays.swift Sources/UUDisplay/VirtualDisplayReadiness.swift \
   tests/display-session-main.swift -o "$TEST_DIR/display-tests"

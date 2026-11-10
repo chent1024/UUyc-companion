@@ -42,13 +42,14 @@ final class Coordinator {
     var statusText: String {
         if display.wedged { return "⛔️ 显示事务失败，已停止自动调整，请检查恢复记录" }
         if display.recoveryFailed { return "⚠️ 显示恢复未完成，记录已保留，请手动恢复" }
+        if display.windowRecoveryFailed { return "⚠️ 窗口归位未完成，已停止自动调整；请检查布局" }
         if store.config.paused { return "虚拟屏已暂停：连接时不做调整" }
         guard connected else { return "等待其它设备连接中" }
         let who = controllerName ?? "未知设备"
         if display.current != nil, display.isActive {
             return "\(who) 已连接 · \(display.virtualStatusText)"
         }
-        return "\(who) 已连接 · 虚拟屏没有调整"
+        return "\(who) 已连接 · \(display.windowStatusText ?? "虚拟屏没有调整")"
     }
 
     // MARK: - 事件

@@ -13,12 +13,15 @@ import Foundation
         var readiness = VirtualDisplayReadiness(online: true, active: true, mode: nil)
         precondition(readiness.isOnline, "缺少模式元数据不能判定已在线的虚拟屏离线")
         precondition(!readiness.modeMatches(redmi), "模式缺失时不能关闭物理屏")
+        precondition(!readiness.canKeepOnlyVirtual(redmi))
         let unknownStatus = readiness.status(for: redmi)
         precondition(unknownStatus.contains("模式未确认") && !unknownStatus.contains("高清") && !unknownStatus.contains("已匹配"))
         readiness.active = false
         precondition(!readiness.isOnline)
+        precondition(!readiness.canKeepOnlyVirtual(redmi))
         readiness.active = true; readiness.online = false
         precondition(!readiness.isOnline)
+        precondition(!readiness.canKeepOnlyVirtual(redmi))
 
         // 合成可读模式用于边界测试，不作为红米实际 HiDPI 已启用的证据。
         var readable = captured.displays[0].mode
@@ -26,18 +29,32 @@ import Foundation
         readable.pixelWidth = 488; readable.pixelHeight = 1084; readable.usable = true
         readiness = VirtualDisplayReadiness(online: true, active: true, mode: readable)
         precondition(readiness.modeMatches(redmi))
+        precondition(readiness.canKeepOnlyVirtual(redmi))
         precondition(readiness.status(for: redmi).contains("高清"))
         readable.width = 488; readable.height = 1084
         readiness.mode = readable
         precondition(readiness.isOnline && !readiness.modeMatches(redmi), "实际为 1x 时保留屏幕，但不能宣称符合 HiDPI 配置")
+        precondition(readiness.canKeepOnlyVirtual(redmi), "11/8 红米复现：实际 1x 可用且像素正确时，也应只保留虚拟屏")
+        precondition(readiness.status(for: redmi).contains("标准模式") && readiness.status(for: redmi).contains("HiDPI 未启用"))
+        precondition(!readiness.status(for: redmi).contains("高清"))
         var standard = redmi; standard.hiDPI = false
         precondition(readiness.modeMatches(standard) && !readiness.status(for: standard).contains("高清"))
         readable.pixelWidth = 976; readiness.mode = readable
         precondition(readiness.isOnline && !readiness.modeMatches(standard))
+        precondition(!readiness.canKeepOnlyVirtual(standard), "像素尺寸错误不能关闭物理屏")
         readable.pixelWidth = 488; readable.usable = false; readiness.mode = readable
         precondition(readiness.isOnline && !readiness.modeMatches(standard), "桌面模式核验失败不能关闭物理屏")
+        precondition(!readiness.canKeepOnlyVirtual(standard))
+        readable.usable = true; readable.width = 244; readable.height = 542
+        readiness.mode = readable
+        precondition(readiness.canKeepOnlyVirtual(standard) && !readiness.modeMatches(standard), "可用像素匹配与请求的逻辑缩放是独立条件")
+        readable.pixelHeight = 1080; readiness.mode = readable
+        precondition(!readiness.canKeepOnlyVirtual(standard), "像素高度错误不能关闭物理屏")
+        readable.pixelHeight = 1084; readable.width = 0; readiness.mode = readable
+        precondition(!readiness.canKeepOnlyVirtual(standard), "无有效逻辑画布不能关闭物理屏")
         readiness.mode = nil
         precondition(readiness.isOnline && !readiness.modeMatches(redmi), "模式证据消失后仍保留屏幕，并收回禁用物理屏的条件")
+        precondition(!readiness.canKeepOnlyVirtual(redmi))
         try captured.save(to: file)
         let loaded = try DisplaySession.load(from: file)
         precondition(loaded.displays == captured.displays, "快照必须无损保存每屏模式与布局")
@@ -128,7 +145,7 @@ import Foundation
              uuid: { _ in nil }, currentBootSession: bootA)!
         precondition(stableMerge.displays.count == 2 && stableMerge.bootSession == bootA)
         print("PASS: real \(captured.displays.count)-display snapshot/roundtrip/exact mode selection; HiDPI/refresh/flags; unplugged retention; stale/reboot/reused ID recovery; corrupt records")
-        print("PASS: captured Redmi missing-mode regression; online/active independence; verified HiDPI/1x; wrong pixels; GUI unavailable; metadata loss; truthful status")
+        print("PASS: Redmi virtual-only independent of HiDPI; online/active; missing mode; valid 1x/2x; wrong width/height; GUI unavailable; metadata loss; truthful status")
         print("PASS: disabled-display UUID=nil regression; partial restore skips active display; record merge preserves both displays; identity verified before clearing")
         print("PASS: stable kernel boot identity survives clock change and rejects previous/unknown boot")
     }

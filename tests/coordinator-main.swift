@@ -10,6 +10,8 @@ enum UUReader {
 }
 enum PhysicalDisplays { static var available = true }
 final class DisplayManager {
+    var windowRecoveryFailed = false
+    var windowStatusText: String?
     var virtualStatusText = "虚拟屏已上线 · 模式未确认 · 物理屏保持开启"
     var shouldDisablePhysical: () -> Bool = { false }
     var wedged = false, recoveryFailed = false, isActive = false, physicalOff = false

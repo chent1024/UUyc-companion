@@ -8,11 +8,22 @@
 //      UUDisplay --tour                        只展示功能导览
 //      UUDisplay --open-settings [面板]          启动后直接打开设置窗口
 //      UUDisplay --render-about <png>            渲染「关于」窗口
+//      UUDisplay --check-window-capture         只读核对窗口基线，不启动显示管理/心跳
 import AppKit
 import Carbon.HIToolbox
 import PermissionFlow
 import ServiceManagement
 import SwiftUI
+
+if CommandLine.arguments.contains("--check-window-capture") {
+    let access = AccessibilityWindows()
+    guard let windows = access.capture() else {
+        print("窗口基线不可用：\(access.captureFailure ?? "unknown")")
+        exit(1)
+    }
+    print("窗口基线可读：\(windows.count) 个，原先可见 \(windows.filter { $0.visible }.count) 个；仅只读检查，未调整窗口或显示器")
+    exit(0)
+}
 
 if CommandLine.arguments.contains("--watchdog") { Watchdog.run() }
 
@@ -152,7 +163,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 退出前异步收尾（恢复物理屏、移除虚拟屏、还原布局）。
     /// 注意：.terminateLater 期间主队列的延时任务不会执行，收尾会卡住；
-    /// 所以先取消本次退出，收尾完成后再真正退出（最多等 8 秒，残留由看门狗兜底）。
+    /// 所以先取消本次退出，给显示拓扑及分阶段窗口读回留出最多 30 秒。
+    /// 超时会明确记录未完成；看门狗只能兜底屏幕，无法兜底内存中的窗口原位。
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
         if terminating { return .terminateNow }
         terminating = true
@@ -164,7 +176,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
         }
         coordinator.shutdown(completion: finish)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 8, execute: finish)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 30) {
+            if !done { Log.info("⚠️ 退出收尾超时，窗口恢复可能未完成；屏幕恢复记录仍按核验结果保留") }
+            finish()
+        }
         return .terminateCancel
     }
 

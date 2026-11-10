@@ -88,8 +88,8 @@ struct PermissionsView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
-                Text("允许 UU远程伴侣 读取设备名称").font(.title2.bold())
-                Text("远程开始时，才能认出是哪台设备，并准备对应分辨率的虚拟屏。")
+                Text("允许识别设备和调整工作窗口").font(.title2.bold())
+                Text("用于准备对应虚拟屏，并在连接和断开时收拢、恢复工作窗口的位置与尺寸。")
                     .foregroundStyle(.secondary)
             }
 
@@ -99,7 +99,7 @@ struct PermissionsView: View {
                 title: Text(PermissionFlowResources.localizedString(
                     for: PermissionFlowResources.accessibilityName(), localeIdentifier: "zh-Hans")),
                 tag: "必需",
-                detail: "用来读取 UU远程 里显示的设备名称，不会读取你的其他内容。",
+                detail: "读取 UU远程 的设备名称，以及工作窗口的几何和状态。不读取其他应用的标题、文档或窗口内容。",
                 ok: model.axGranted,
                 okText: "已授权",
                 pendingText: "未授权",
