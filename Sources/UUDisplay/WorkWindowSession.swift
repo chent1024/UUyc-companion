@@ -40,7 +40,7 @@ struct SavedWorkWindow {
 enum WorkWindowRead {
     case window(WorkWindowState)
     case closed
-    case unavailable
+    case unavailable(String)
 }
 
 /// 原生边界集中于此；测试用隔离窗口替身，不接触用户桌面。
@@ -59,6 +59,7 @@ final class WorkWindowSession {
     }
     enum Progress: Equatable {
         case pending
+        case waitingForMetadata
         case complete(verified: Int, skipped: Int)
         case failed([UInt32])
     }
@@ -69,32 +70,98 @@ final class WorkWindowSession {
     private var stable = 0
     private var finished: Progress?
     private(set) var mismatches: [UInt32] = []
+    private(set) var mismatchReasons: [UInt32: String] = [:]
+    private var metadataWaitSince: TimeInterval?
+    private var metadataWaitReported = false
 
-    init?(access: WorkWindowAccess) {
-        guard let windows = access.capture() else { return nil }
+    /// 锁屏不是窗口恢复失败；不丢弃原位，解锁后从换屏阶段重新核对。
+    func suspendForLockedScreen() {
+        pass = 0; stable = 0; finished = nil
+        metadataWaitSince = nil; metadataWaitReported = false
+    }
+
+    let captureAttempts: Int
+
+    init?(access: WorkWindowAccess, retryDelay: () -> Void = { Thread.sleep(forTimeInterval: 0.5) }) {
+        // UU 切换连接/模式时 AX 窗口表可能暂不可读。仅重采样，不写任何窗口或显示配置。
+        var captured: [SavedWorkWindow]?
+        var attempts = 0
+        for attempt in 0..<3 {
+            attempts += 1
+            captured = access.capture()
+            if captured != nil { break }
+            if attempt < 2 { retryDelay() }
+        }
+        guard let windows = captured else { return nil }
         self.access = access
         self.windows = windows
+        self.captureAttempts = attempts
+    }
+
+    /// 空闲采样的原始几何不可被活动会话的收拢/归位进度覆盖。
+    func forConnection() -> WorkWindowSession {
+        WorkWindowSession(access: access, windows: windows, captureAttempts: captureAttempts)
+    }
+
+    private init(access: WorkWindowAccess, windows: [SavedWorkWindow], captureAttempts: Int) {
+        self.access = access
+        self.windows = windows
+        self.captureAttempts = captureAttempts
     }
 
     /// 每次只做一个阶段，调用方须让出运行循环等待后再调用。
     /// 先换屏，再改尺寸，再校正位置；不能把 AX 返回 success 当成落地成功。
-    func advance(_ next: Goal) -> Progress {
+    func advance(_ next: Goal, now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> Progress {
         if goal != next {
             goal = next; pass = 0; stable = 0; finished = nil
+            metadataWaitSince = nil; metadataWaitReported = false
         }
         if let finished { return finished }
+        let observations = windows.map { ($0, access.read($0.id)) }
+        var notReady: [UInt32: String] = [:]
+        for (saved, result) in observations {
+            switch result {
+            case .closed: break
+            case .unavailable(let reason): notReady[saved.id.number] = reason
+            case .window(let now):
+                guard !saved.state.minimized, !saved.state.fullscreen, !now.minimized, !now.fullscreen else { continue }
+                if next == .restore {
+                    if now.desktop == nil { notReady[saved.id.number] = "current desktop metadata unavailable" }
+                    else if let desktop = saved.state.desktop, !access.desktopAvailable(desktop) {
+                        notReady[saved.id.number] = "original display absent from desktop metadata: \(desktop.display)"
+                    }
+                }
+            }
+        }
+        if !notReady.isEmpty {
+            mismatchReasons = notReady
+            mismatches = notReady.keys.sorted()
+            stable = 0
+            let start = metadataWaitSince ?? now
+            metadataWaitSince = start
+            if now - start >= 15 {
+                let result = Progress.failed(mismatches)
+                finished = result
+                return result
+            }
+            if !metadataWaitReported { metadataWaitReported = true; return .waitingForMetadata }
+            return .pending
+        }
+        metadataWaitSince = nil; metadataWaitReported = false
+        mismatchReasons = [:]
         var bad: [UInt32] = []
         var verified = 0
         var skipped = 0
-        for saved in windows {
-            switch access.read(saved.id) {
+        for (saved, result) in observations {
+            switch result {
             case .closed: skipped += 1
-            case .unavailable: bad.append(saved.id.number)
+            case .unavailable(let reason): bad.append(saved.id.number); mismatchReasons[saved.id.number] = reason
             case .window(let now):
                 // 用户在连接期间改变的特殊状态也不强行还原。
                 if saved.state.minimized || saved.state.fullscreen {
                     if saved.state.minimized != now.minimized || saved.state.fullscreen != now.fullscreen {
                         bad.append(saved.id.number)
+                        mismatchReasons[saved.id.number] = "minimized/fullscreen state changed; not forced"
                     } else { skipped += 1 }
                     continue
                 }
@@ -114,14 +181,21 @@ final class WorkWindowSession {
                     target = saved.state.frame
                     guard let originalDesktop = saved.state.desktop, let desktop = now.desktop,
                           access.desktopAvailable(originalDesktop) else {
-                        bad.append(saved.id.number); continue
+                        bad.append(saved.id.number); mismatchReasons[saved.id.number] = "original/current desktop metadata missing"; continue
                     }
                     matches = Self.near(now.frame, target) && originalDesktop.matches(desktop)
                     // 非当前桌面的窗口不主动跨桌面移动；仍核验原归属，不能把跳过当成已恢复。
-                    if !saved.visible && !matches { bad.append(saved.id.number); continue }
+                    if !saved.visible && !matches {
+                        bad.append(saved.id.number)
+                        mismatchReasons[saved.id.number] = "other desktop retained; geometry/desktop differs"
+                        continue
+                    }
                 }
                 if matches { verified += 1; continue }
                 bad.append(saved.id.number)
+                let geometry = Self.near(now.frame, target)
+                let desktop = saved.state.desktop.map { original in now.desktop.map { original.matches($0) } ?? false } ?? false
+                mismatchReasons[saved.id.number] = "geometry=\(geometry), desktop=\(desktop), originalDisplay=\(saved.state.desktop?.display ?? "unknown"), currentDisplay=\(now.desktop?.display ?? "unknown"), originalSpace=\(String(describing: saved.state.desktop?.space)), currentSpace=\(String(describing: now.desktop?.space)), originalSingle=\(String(describing: saved.state.desktop?.soleUserSpace)), currentSingle=\(String(describing: now.desktop?.soleUserSpace))"
                 // 第 3/4 个阶段只读取，连续两次一致后才完成；最多三轮写入。
                 if pass < 15 {
                     switch pass % 5 {

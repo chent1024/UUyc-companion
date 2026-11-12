@@ -30,6 +30,7 @@ final class Coordinator {
         monitor.onConnect = { [weak self] in self?.handleConnect() }
         monitor.onDisconnect = { [weak self] in self?.handleDisconnect() }
         monitor.onIdle = { [weak self] in self?.display.observeIdleDisplays() }
+        monitor.onObservation = { [weak self] in self?.display.observeIdleWindows() }
         display.observeIdleDisplays()
         monitor.start()
     }
@@ -94,7 +95,7 @@ final class Coordinator {
     }
 
     private func readControllerName() -> String? {
-        guard UUReader.isTrusted else { return nil }
+        guard UUReader.isTrusted, !monitor.isScreenLocked else { return nil }
         switch monitor.currentControllers {
         case .none:
             // 未获得可用快照：只尝试展开一次窗口，不能把缓存缺失当成窗口不存在。

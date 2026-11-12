@@ -3,7 +3,8 @@
 // 原因（实测）：重新启用物理屏的热插拔事件尚未处理完时又新建虚拟屏，applySettings 失败，
 //              随后 WindowServer 在 GenerateModeListForDisplay 中 abort，系统注销重启。
 //      另：虚拟屏创建后约 1 秒、尚未完全上线时就释放，会让 WindowServer 显示配置卡死（所有事务 10 秒超时，
-//      需重启恢复），因此释放前必须已上线且存活 ≥ 2.5 秒；一旦检测到超时即进入保护状态，不再做拓扑变化。
+//      需重启恢复），因此释放前必须已上线且存活 ≥ 2.5 秒；超时后不再提交配置事务，
+//      仅在物理屏已可用并稳定时释放本进程持有的虚拟屏，避免残留虚拟主屏。
 // 其他要点：虚拟屏只给一个模式且不改；GUI 主线程不能调 CGCompleteDisplayConfiguration（放 cgQueue）；
 //          物理屏是否被禁用以磁盘记录为准（看门狗可能在别的进程里已恢复）。
 import CGVirtualDisplayBridge
@@ -37,7 +38,13 @@ final class DisplayManager {
     private var savedSession: DisplaySession?
     private var idleSession: DisplaySession?
     private var connectionBaseline: DisplaySession?
-    private var restoredBeforeRemoval = false
+    private var idleWindowBaseline: (displays: DisplaySession, windows: WorkWindowSession, sampledAt: TimeInterval)?
+    private var connectionWindows: WorkWindowSession?
+    private var idleWindowReadInFlight = false
+    private var idleWindowEpoch = 0
+    private var lastIdleWindowReadAt: TimeInterval = -Double.infinity
+    private var idleWindowFailure: String?
+    private var displayRecovery = DisplayRecovery()
     private var restoreAttempts = 0
     private(set) var recoveryFailed = false
     private var unreadableSession = false
@@ -47,7 +54,8 @@ final class DisplayManager {
     private var endingWindowSession = false
     private(set) var windowRecoveryFailed = false
     private(set) var windowStatusText: String?
-    private let windowQueue = DispatchQueue(label: "uudisplay.window-layout")
+    private var waitingForUnlock = false
+    private let windowQueue = DispatchQueue(label: "uudisplay.window-layout", autoreleaseFrequency: .workItem)
 
     // 执行器
     private var busy = false
@@ -57,7 +65,7 @@ final class DisplayManager {
     private var modeProbeTries = 0
     private var bornAt: [CGDirectDisplayID: Date] = [:]
     private var releaseWaitStart: Date?
-    /// WindowServer 显示配置无响应（事务超时）：停止建屏/删屏/改布局
+    /// WindowServer 配置超时：停止配置事务；物理屏可用时仍收尾所属虚拟屏。
     private(set) var wedged = false
     static let minLifetime: TimeInterval = 2.5
     private let cgQueue = DispatchQueue(label: "uudisplay.display-config")
@@ -127,20 +135,89 @@ final class DisplayManager {
             kick()
             return
         }
-        idleSession = DisplaySession.capture()
+        if let current = DisplaySession.capture() {
+            if idleSession?.sameConfiguration(as: current) != true {
+                idleWindowBaseline = nil
+                idleWindowEpoch += 1
+            }
+            idleSession = current
+        } else {
+            idleSession = nil; idleWindowBaseline = nil; idleWindowEpoch += 1
+        }
+        observeIdleWindows()
+    }
+
+    /// 只在没有托管虚拟屏/恢复任务，且当前物理配置仍等于安全空闲配置时采样。
+    /// 电脑远控在线也可采样；UU 临时改模式之后的布局不能覆盖连接前的窗口基线。
+    func observeIdleWindows() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard !ScreenLock.isLocked, desired == nil, savedSession == nil, windowSession == nil, connectionBaseline == nil,
+              !recovering, !busy, !endingWindowSession, vd == nil, let expected = idleSession,
+              let before = DisplaySession.capture() else { return }
+        if !expected.sameConfiguration(as: before) {
+            // UU 可能先换物理模式、稍后才在 AX 表里给出手机名；在最早的变化处冻结旧配对。
+            if let sample = idleWindowBaseline, expected.sameConfiguration(as: sample.displays),
+               now - sample.sampledAt <= 5 {
+                idleWindowEpoch += 1
+                connectionBaseline = sample.displays
+                connectionWindows = sample.windows.forConnection()
+                Log.info("检测到物理模式变化，提前冻结连接前配对基线，等待控制端识别")
+            }
+            return
+        }
+        guard !idleWindowReadInFlight, now - lastIdleWindowReadAt >= 1 else { return }
+        idleWindowReadInFlight = true
+        lastIdleWindowReadAt = now
+        let epoch = idleWindowEpoch
+        windowQueue.async {
+            let access = AccessibilityWindows(diagnostics: { message in DispatchQueue.main.async { Log.info(message) } })
+            let windows = WorkWindowSession(access: access)
+            let after = DisplaySession.capture()
+            DispatchQueue.main.async {
+                self.idleWindowReadInFlight = false
+                guard epoch == self.idleWindowEpoch, self.desired == nil, self.savedSession == nil,
+                      self.windowSession == nil, self.connectionBaseline == nil, !self.recovering,
+                      !self.busy, !self.endingWindowSession, self.vd == nil, !ScreenLock.isLocked else { return }
+                guard let windows, let after, before.sameConfiguration(as: after),
+                      self.idleSession?.sameConfiguration(as: before) == true else {
+                    self.idleWindowFailure = access.captureFailure ?? "采样期间物理屏配置变化"
+                    return
+                }
+                let first = self.idleWindowBaseline == nil
+                self.idleWindowBaseline = (before, windows, ProcessInfo.processInfo.systemUptime)
+                self.idleWindowFailure = nil
+                if first {
+                    let desktops = windows.windows.map { item -> String in
+                        guard let desktop = item.state.desktop else { return "#\(item.id.number):unknown" }
+                        return "#\(item.id.number):\(desktop.display)@\(desktop.space),single=\(desktop.soleUserSpace)"
+                    }.joined(separator: ";")
+                    Log.info("连接前配对基线已就绪：\(windows.windows.count) 个窗口，物理模式和排列在采样前后一致；桌面归属 \(desktops)")
+                }
+            }
+        }
     }
 
     func beginSession() {
-        if connectionBaseline == nil { connectionBaseline = idleSession ?? DisplaySession.capture() }
+        guard connectionBaseline == nil else { return }
+        idleWindowEpoch += 1 // 连接到来后，未完成的空闲读取不得再发布。
+        connectionBaseline = idleSession ?? DisplaySession.capture()
+        if let sample = idleWindowBaseline,
+           connectionBaseline?.sameConfiguration(as: sample.displays) == true,
+           ProcessInfo.processInfo.systemUptime - sample.sampledAt <= 5 || endingWindowSession || recovering {
+            connectionWindows = sample.windows.forConnection()
+        } else { connectionWindows = nil }
     }
 
     func remove(completion: (() -> Void)? = nil) {
         desired = nil
+        if !endingWindowSession { displayRecovery.retry() }
         endingWindowSession = true
         failedCfg = nil
         physicalOverride = false
         disableAttempted = false
         connectionBaseline = nil
+        connectionWindows = nil
+        idleWindowEpoch += 1
         restoreAttempts = 0
         recoveryFailed = false
         if unreadableSession { recoveryFailed = true }
@@ -153,6 +230,7 @@ final class DisplayManager {
     /// 快捷键 / 菜单 / 关闭开关：立即恢复物理屏，虚拟屏保留
     func restorePhysicalNow(override: Bool = true) {
         if override { physicalOverride = true }
+        displayRecovery.retry()
         restoreAttempts = 0
         recoveryFailed = false
         kick()
@@ -215,7 +293,7 @@ final class DisplayManager {
     private func enterWedged(_ err: CGError) {
         guard !wedged else { return }
         wedged = true
-        Log.info("⛔️ 显示配置事务失败（CGError=\(err.rawValue)），停止拓扑变化并保留恢复记录")
+        Log.info("⛔️ 显示配置事务超时（CGError=\(err.rawValue)），停止后续配置事务；物理屏可用时收尾虚拟屏，保留记录待核验")
     }
 
     /// 释放前确认每块屏已上线且存活足够久；最多等 8 秒
@@ -238,16 +316,6 @@ final class DisplayManager {
             if let done = shutdownCompletion { shutdownCompletion = nil; done() }
             return
         }
-        if wedged {
-            // 保护状态：只尝试恢复物理屏，其余全部停止
-            if physicalOff, restoreAttempts < 3 {
-                restoreAttempts += 1
-                return runCG(settle: 3) { PhysicalDisplays.restore(reason: "保护状态") ? .success : .failure }
-            }
-            if let done = shutdownCompletion { shutdownCompletion = nil; done() }
-            return
-        }
-
         // 1. 配置失败的屏：稳定后释放
         if !broken.isEmpty {
             guard readyToRelease(broken) else { busy = true; return finish(settle: 0.5) }
@@ -256,16 +324,12 @@ final class DisplayManager {
             return finish(settle: 1.5)
         }
 
-        guard let want = (recovering || endingWindowSession) ? nil : desired else {
-            // 恢复物理屏 → 交还原模式/主屏并核验 → 释放虚拟屏 → 再次核验
-            if physicalOff {
-                guard allowRestoreAttempt() else { return }
-                return runCG(settle: 1.5) { PhysicalDisplays.restore(reason: "远程结束") ? .success : .failure }
-            }
+        guard let want = (recovering || endingWindowSession || wedged) ? nil : desired else {
+            // 原模式不可用时也必须先安全释放虚拟屏，不能形成“恢复成功才可释放”的循环。
             if let origins = legacyOrigins, savedSession == nil {
-                legacyOrigins = nil
                 // 旧版禁用屏先上线，之后才能把旧原点绑定到当前身份。
                 if var legacy = DisplaySession.capture() {
+                    legacyOrigins = nil
                     for (key, value) in origins where value.count == 2 {
                         guard let id = UInt32(key), let uuid = DisplaySession.uuid(id),
                               let index = legacy.displays.firstIndex(where: { $0.uuid == uuid }),
@@ -276,30 +340,9 @@ final class DisplayManager {
                     Log.info("旧版记录只可恢复布局，原分辨率与刷新率未知")
                 }
             }
-            if let session = savedSession, !restoredBeforeRemoval {
-                guard allowRestoreAttempt() else { return }
-                let retaining = (retiring + [vd].compactMap { $0 }).map(\.displayID)
-                return runCG(settle: 1.5, completion: { err in
-                    if err == .success { self.restoredBeforeRemoval = true; self.mainSet = false }
-                }) { session.restore(retaining: retaining) }
-            }
-            if let session = savedSession, !session.verified() {
-                restoredBeforeRemoval = false
-                return retryRestore()
-            }
-            if vd != nil || !retiring.isEmpty {
-                guard readyToRelease(retiring + [vd].compactMap { $0 }) else { busy = true; return finish(settle: 0.5) }
-                busy = true
-                var all = retiring + [vd].compactMap { $0 }
-                retiring = []
-                vd = nil
-                current = nil
-                mainSet = false
-                release(&all)
-                return finish(settle: 1.5)
-            }
+            if advanceDisplayRecovery() { return }
             if let session = savedSession {
-                guard session.verified() else { restoredBeforeRemoval = false; return retryRestore() }
+                guard session.verified() else { busy = true; return finish(settle: 0.5) }
                 do {
                     if let offline = session.offline() {
                         try offline.save()
@@ -316,7 +359,7 @@ final class DisplayManager {
                     return
                 }
                 savedSession = nil
-                restoredBeforeRemoval = false
+                displayRecovery = DisplayRecovery()
                 restoreAttempts = 0
                 Log.info("✅ 已核验物理屏模式、刷新率、镜像关系与布局")
             }
@@ -328,11 +371,11 @@ final class DisplayManager {
             if recovering {
                 recovering = false
                 Log.info("残留状态已恢复")
-                if desired != nil { return step() }
+                if desired != nil, !wedged { return step() }
             }
             physicalModeRestorePending = false
             // 断开恢复中又连入：先完成旧窗口归位，之后才允许采集下一轮基线。
-            if desired != nil, !windowRecoveryFailed { return step() }
+            if desired != nil, !windowRecoveryFailed, !wedged { return step() }
             if let done = shutdownCompletion {
                 shutdownCompletion = nil
                 done()
@@ -345,24 +388,15 @@ final class DisplayManager {
             guard !windowRecoveryFailed else { return }
             guard !DisplayManager.same(failedCfg, want) else { return }
             if windowSession == nil {
-                busy = true
-                windowQueue.async {
-                    let access = AccessibilityWindows()
-                    let session = WorkWindowSession(access: access)
-                    DispatchQueue.main.async {
-                        self.windowSession = session
-                        if session == nil {
-                            self.failedCfg = want
-                            self.windowStatusText = "无法取得完整窗口基线，未调整显示器"
-                            Log.info("⚠️ 无法取得完整窗口基线，保留当前显示与窗口布局；\(access.captureFailure ?? "unknown")")
-                        } else {
-                            self.windowStatusText = nil
-                            Log.info("已保存连接前窗口基线：\(session!.windows.count) 个；只记录身份、几何与状态")
-                        }
-                        self.finish(settle: 0)
-                    }
+                guard let original = connectionWindows else {
+                    failedCfg = want
+                    windowStatusText = "连接前窗口基线未就绪，请断开后重连"
+                    Log.info("⚠️ 缺少连接前完整配对基线，未建屏、未关屏；\(idleWindowFailure ?? "预采样尚未完成或过期")")
+                    return
                 }
-                return
+                windowSession = original
+                windowStatusText = nil
+                Log.info("已冻结连接前配对窗口基线：\(original.windows.count) 个，采样 \(original.captureAttempts) 次；未采纳 UU 连接后的临时布局")
             }
             busy = true
             if savedSession == nil {
@@ -378,7 +412,7 @@ final class DisplayManager {
                 }
                 do { try baseline.save(); savedSession = baseline }
                 catch { busy = false; failedCfg = want; Log.info("⚠️ 无法保存显示配置，放弃建屏：\(error)"); return }
-                restoredBeforeRemoval = false
+                displayRecovery = DisplayRecovery()
             }
             if let old = vd { retiring.append(old) }
             vd = nil
@@ -441,7 +475,7 @@ final class DisplayManager {
         if !wantOff, physicalOff {
             physicalModeRestorePending = true
             guard allowRestoreAttempt() else { return }
-            return runCG(settle: 1.5) { PhysicalDisplays.restore(reason: "物理屏不再满足禁用条件") ? .success : .failure }
+            return runCG(settle: 1.5) { PhysicalDisplays.restore(reason: "物理屏不再满足禁用条件") }
         }
         if !wantOff, (physicalModeRestorePending || physicalOverride), let session = savedSession {
             if !session.verified(includeLayout: false) {
@@ -492,17 +526,86 @@ final class DisplayManager {
         }
     }
 
+    /// 返回 true 表示本轮仍在恢复或失败；false 才允许清理记录及恢复窗口。
+    private func advanceDisplayRecovery() -> Bool {
+        let owned = retiring + [vd].compactMap { $0 }
+        guard savedSession != nil || legacyOrigins != nil || physicalOff || !owned.isEmpty ||
+              !displayRecovery.releasedVirtual.isEmpty else { return false }
+        let online = Set(Self.onlineDisplays())
+        let hasActivePhysical = online.contains { id in
+            !Self.isVirtual(id) && CGDisplayIsActive(id) != 0 && DisplaySession.uuid(id) != nil &&
+                CGDisplayCopyDisplayMode(id)?.isUsableForDesktopGUI() == true
+        }
+        let canReadModes = owned.isEmpty && displayRecovery.releasedVirtual.isDisjoint(with: online)
+        let action = displayRecovery.next(.init(
+            pendingEnable: physicalOff, hasActivePhysical: hasActivePhysical,
+            physical: DisplaySession.capture()?.displays, ownedVirtual: Set(owned.map(\.displayID)),
+            virtualReadyToRelease: owned.isEmpty || readyToRelease(owned), online: online,
+            modesAvailable: canReadModes && (savedSession?.modesAvailable() ?? true),
+            configurationVerified: savedSession?.verified() ?? true,
+            transactionTimedOut: wedged, now: ProcessInfo.processInfo.systemUptime))
+        switch action {
+        case .enablePhysical:
+            runCG(settle: 1.5, completion: { error in
+                self.displayRecovery.didEnableResult(accepted: error == .success, now: ProcessInfo.processInfo.systemUptime)
+                if error == .success, self.physicalOff {
+                    Log.info("物理屏启用事务已接受，等待活动状态落地，期间不重复提交启用")
+                }
+            }) { PhysicalDisplays.restore(reason: "远程结束") }
+        case .releaseVirtual:
+            busy = true
+            var all = owned
+            retiring = []; vd = nil; current = nil; mainSet = false
+            release(&all)
+            finish(settle: 1.5)
+        case .restoreConfiguration:
+            guard let session = savedSession else { return false }
+            runCG(settle: 1.5) {
+                let err = session.restore()
+                Log.info(err == .success ? "已提交原物理屏模式、主屏和排列恢复，等待连续核验" : "⚠️ 原物理屏配置恢复 CGError=\(err.rawValue)")
+                return err
+            }
+        case .wait:
+            busy = true
+            finish(settle: 0.5)
+        case .failed(let reason):
+            recoveryFailed = true
+            Log.info("⚠️ \(reason)")
+            if let done = shutdownCompletion { shutdownCompletion = nil; done() }
+        case .complete: return false
+        }
+        return true
+    }
+
     private func advanceWindows(_ goal: WorkWindowSession.Goal, display: CGDirectDisplayID? = nil) {
         guard let session = windowSession else { return }
+        if ScreenLock.isLocked {
+            session.suspendForLockedScreen()
+            windowStatusText = goal == .restore ? "物理屏已恢复，等待解锁后恢复窗口" : "等待解锁后收拢窗口"
+            if !waitingForUnlock { waitingForUnlock = true; Log.info(windowStatusText!) }
+            busy = true
+            return finish(settle: 1)
+        }
+        if waitingForUnlock {
+            waitingForUnlock = false
+            Log.info("Mac 已解锁，继续原会话窗口收尾；不更改原位基线")
+        }
         busy = true
         windowQueue.async {
             let progress = session.advance(goal)
             DispatchQueue.main.async {
                 switch progress {
                 case .pending: break
+                case .waitingForMetadata:
+                    self.windowStatusText = "等待窗口信息稳定"
+                    Log.info("等待窗口可用元数据，不消耗搬窗预算：\(session.mismatchReasons)")
                 case .complete(let verified, let skipped):
                     if goal == .restore {
                         self.windowSession = nil
+                        if let sample = self.idleWindowBaseline,
+                           DisplaySession.capture()?.sameConfiguration(as: sample.displays) == true {
+                            self.idleWindowBaseline = (sample.displays, sample.windows, ProcessInfo.processInfo.systemUptime)
+                        }
                         self.collectedDisplay = nil
                         self.windowStatusText = nil
                         Log.info("✅ 窗口原位读回核验完成：\(verified) 个，关闭或特殊状态跳过 \(skipped) 个")
@@ -519,7 +622,7 @@ final class DisplayManager {
                         self.collectedDisplay = display
                         self.windowStatusText = "部分窗口未收拢，断开后仍将恢复原位"
                     }
-                    Log.info("⚠️ \(self.windowStatusText!)；未通过读回核验的窗口 ID：\(ids)")
+                    Log.info("⚠️ \(self.windowStatusText!)；未通过读回核验的窗口 ID：\(ids)；原因：\(session.mismatchReasons)")
                 }
                 self.finish(settle: 0.35)
             }
@@ -571,6 +674,7 @@ final class DisplayManager {
     private func release(_ displays: inout [CGVirtualDisplay]) {
         guard !displays.isEmpty else { return }
         let ids = displays.map { "#\($0.displayID)" }.joined(separator: " ")
+        displayRecovery.didRelease(Set(displays.map(\.displayID)))
         autoreleasepool { displays.removeAll() }
         Log.info("✅ 已移除虚拟屏 \(ids)")
     }
@@ -585,8 +689,4 @@ final class DisplayManager {
         return true
     }
 
-    private func retryRestore() {
-        busy = true
-        finish(settle: 1.5)
-    }
 }

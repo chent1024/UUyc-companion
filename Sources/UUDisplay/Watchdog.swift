@@ -67,11 +67,14 @@ enum Watchdog {
                     recoveryAttempts += 1
                     if physicalPending {
                         // 启用后至少等一个检查间隔，不能在热插拔未稳定时紧接着改模式。
-                        if PhysicalDisplays.restore(reason: "看门狗：主程序\(appExists ? "卡死" : "不在")") {
+                        let err = PhysicalDisplays.restore(reason: "看门狗：主程序\(appExists ? "卡死" : "不在")")
+                        if err.rawValue == 1014 { recoveryAttempts = 3 }
+                        else if err == .success, PhysicalDisplays.pending == nil {
                             recoveryAttempts = 0
                         }
                     } else if let session = try? DisplaySession.load() {
                         let err = session.restore()
+                        if err.rawValue == 1014 { recoveryAttempts = 3 }
                         if err == .success, session.verified() {
                             PhysicalDisplays.clearResolvedRecord()
                             do {
@@ -81,7 +84,10 @@ enum Watchdog {
                         }
                     }
                 } else if let t = uuGoneSince, Date().timeIntervalSince(t) > uuGoneLimit {
-                    PhysicalDisplays.restore(reason: "看门狗：UU 已断开但物理屏未恢复")
+                    guard recoveryAttempts < 3 else { return }
+                    if PhysicalDisplays.restore(reason: "看门狗：UU 已断开但物理屏未恢复").rawValue == 1014 {
+                        recoveryAttempts = 3
+                    }
                 } else {
                     recoveryAttempts = 0
                 }

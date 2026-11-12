@@ -12,10 +12,10 @@ scripts/test-connection.sh
 swiftc Sources/UUDisplay/WorkWindowSession.swift tests/work-windows-main.swift -o "$TEST_DIR/window-tests"
 "$TEST_DIR/window-tests"
 swiftc Sources/UUDisplay/Config.swift Sources/UUDisplay/Log.swift \
-  Sources/UUDisplay/DisplaySession.swift Sources/UUDisplay/PhysicalDisplays.swift Sources/UUDisplay/VirtualDisplayReadiness.swift \
-  tests/display-session-main.swift -o "$TEST_DIR/display-tests"
+  Sources/UUDisplay/DisplaySession.swift Sources/UUDisplay/PhysicalDisplays.swift Sources/UUDisplay/VirtualDisplayReadiness.swift Sources/UUDisplay/DisplayRecovery.swift \
+  tests/display-recovery-sequence.swift tests/display-session-main.swift -o "$TEST_DIR/display-tests"
 "$TEST_DIR/display-tests" "$TEST_DIR"
-swiftc Sources/UUDisplay/Config.swift Sources/UUDisplay/UUConnectionState.swift \
+swiftc Sources/UUDisplay/ScreenLock.swift Sources/UUDisplay/Config.swift Sources/UUDisplay/UUConnectionState.swift \
   Sources/UUDisplay/UUMonitor.swift Sources/UUDisplay/Coordinator.swift \
   tests/coordinator-main.swift -o "$TEST_DIR/coordinator-tests"
 "$TEST_DIR/coordinator-tests" "$TEST_DIR/config"

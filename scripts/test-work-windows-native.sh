@@ -10,7 +10,7 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 export TMPDIR="$TEST_DIR"
 APP="$TEST_DIR/WindowFixture.app"
 mkdir -p "$APP/Contents/MacOS"
-swiftc Sources/UUDisplay/WorkWindowSession.swift Sources/UUDisplay/AccessibilityWindows.swift \
+swiftc Sources/UUDisplay/ScreenLock.swift Sources/UUDisplay/WorkWindowSession.swift Sources/UUDisplay/AccessibilityWindows.swift \
   tests/native-windows-main.swift -o "$APP/Contents/MacOS/window-fixture"
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>

@@ -36,7 +36,7 @@ enum UUReader {
 
     /// 先序遍历；UU 的 AX 树存在环，必须限制深度
     private static func flatten(_ el: AXUIElement, depth: Int = 0, into out: inout [AXUIElement]) {
-        guard depth < 25 else { return }
+        guard depth < 25, !out.contains(where: { CFEqual($0, el) }) else { return }
         out.append(el)
         for k in (attr(el, kAXChildrenAttribute) as? [AXUIElement]) ?? [] {
             flatten(k, depth: depth + 1, into: &out)
@@ -53,6 +53,7 @@ enum UUReader {
     /// 点 UU 菜单栏图标里的「显示主界面」
     @discardableResult
     static func showMainWindow() -> Bool {
+        guard !ScreenLock.isLocked else { return false }
         guard let ax = appElement(), let bar = attr(ax, kAXExtrasMenuBarAttribute),
               CFGetTypeID(bar) == AXUIElementGetTypeID() else { return false }
         var all: [AXUIElement] = []
@@ -64,6 +65,7 @@ enum UUReader {
     /// 读取「全部设备」列表。主窗口不存在返回 nil。
     /// 结构：分组标题（电脑 / 手机/平板）→ 32 号设备图标 + 设备名 [+ 「本机」]
     static func readDevices() -> [UUDevice]? {
+        guard !ScreenLock.isLocked else { return nil }
         let wins = windows()
         guard !wins.isEmpty else { return nil }
         var all: [AXUIElement] = []
@@ -110,6 +112,7 @@ enum UUReader {
 
     /// 读取「本机被控中」表格里的控制端设备名。主窗口不存在返回 nil，无人控制返回 []
     static func readControllers() -> [String]? {
+        guard !ScreenLock.isLocked else { return nil }
         let wins = windows()
         guard !wins.isEmpty else { return nil }
         var all: [AXUIElement] = []

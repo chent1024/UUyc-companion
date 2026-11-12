@@ -17,8 +17,10 @@ final class DisplayManager {
     var wedged = false, recoveryFailed = false, isActive = false, physicalOff = false
     var current: DeviceConfig?
     var creations: [String] = [], removals = 0
+    var windowObservations = 0
     func recoverIfNeeded() {}
     func observeIdleDisplays() {}
+    func observeIdleWindows() { windowObservations += 1 }
     func beginSession() {}
     func matches(_ cfg: DeviceConfig) -> Bool { current == cfg }
     func create(_ cfg: DeviceConfig) { current = cfg; isActive = true; creations.append(cfg.name) }
@@ -37,7 +39,7 @@ final class DisplayManager {
         var overlay = true
         let monitor = UUMonitor(trusted: { true }, readControllers: {
             lock.lock(); defer { lock.unlock() }; return names
-        }, hasOverlay: { overlay })
+        }, hasOverlay: { overlay }, locked: { false })
         let display = DisplayManager()
         let coordinator = Coordinator(monitor: monitor, display: display, store: store)
         coordinator.start()
@@ -52,6 +54,9 @@ final class DisplayManager {
         RunLoop.main.run(until: Date().addingTimeInterval(1.6))
         precondition(!display.isActive, "切到电脑必须移除虚拟屏")
         precondition(display.current == nil, "不能以尚未激活为由跳过移除/取消")
+        let windowObservations = display.windowObservations
+        RunLoop.main.run(until: Date().addingTimeInterval(0.6))
+        precondition(display.windowObservations > windowObservations, "电脑远控在线时仍须通知空闲窗口预采样")
         lock.lock(); names = ["Redmi22081212C"]; lock.unlock()
         RunLoop.main.run(until: Date().addingTimeInterval(1.6))
         precondition(display.creations.count == 2)

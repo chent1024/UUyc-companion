@@ -6,6 +6,8 @@ final class UUMonitor {
     var onConnect: (() -> Void)?
     var onDisconnect: (() -> Void)?
     var onIdle: (() -> Void)?
+    /// 电脑远控仍连接时，显示管理也可能空闲；让显示管理自行判断窗口预采样条件。
+    var onObservation: (() -> Void)?
     private(set) var connected = false
 
     private var timer: Timer?
@@ -23,13 +25,17 @@ final class UUMonitor {
     private let trusted: () -> Bool
     private let readControllers: () -> [String]?
     private let hasOverlay: () -> Bool
+    private let locked: () -> Bool
+    var isScreenLocked: Bool { locked() }
 
     init(trusted: @escaping () -> Bool = { UUReader.isTrusted },
          readControllers: @escaping () -> [String]? = { UUReader.readControllers() },
-         hasOverlay: @escaping () -> Bool = { UUMonitor.overlayPresent() }) {
+         hasOverlay: @escaping () -> Bool = { UUMonitor.overlayPresent() },
+         locked: @escaping () -> Bool = { ScreenLock.isLocked }) {
         self.trusted = trusted
         self.readControllers = readControllers
         self.hasOverlay = hasOverlay
+        self.locked = locked
     }
 
     static func overlayPresent() -> Bool {
@@ -43,6 +49,11 @@ final class UUMonitor {
     }
 
     private func tick() {
+        if locked() {
+            controllers = nil; controllersReadAt = .distantPast
+            apply(controllers: nil)
+            return
+        }
         guard trusted() else {
             controllers = nil
             controllersReadAt = .distantPast
@@ -62,7 +73,7 @@ final class UUMonitor {
                 guard let self else { return }
                 self.readInFlight = false
                 // 不使用延迟过久的界面快照确认连接。
-                self.controllers = Date().timeIntervalSince(started) <= 2 ? controllers : nil
+                self.controllers = !self.locked() && Date().timeIntervalSince(started) <= 2 ? controllers : nil
                 self.controllersReadAt = Date()
                 self.apply(controllers: self.controllers)
             }
@@ -85,5 +96,6 @@ final class UUMonitor {
         case nil:
             if !connected { onIdle?() }
         }
+        onObservation?()
     }
 }

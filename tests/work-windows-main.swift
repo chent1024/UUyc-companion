@@ -9,6 +9,8 @@ private let right = WindowDesktop(display: "builtin", space: 1, uuid: "builtin-d
 private let virtual = WindowDesktop(display: "virtual", space: 60, uuid: "remote-desktop", soleUserSpace: true)
 
 private final class Windows: WorkWindowAccess {
+    var captureFailuresRemaining = 0
+    var captures = 0
     var originals: [SavedWorkWindow]
     var current: [WorkWindowID: WorkWindowState]
     var events: [String] = []
@@ -27,10 +29,14 @@ private final class Windows: WorkWindowAccess {
         }
         current = Dictionary(uniqueKeysWithValues: originals.map { ($0.id, $0.state) })
     }
-    func capture() -> [SavedWorkWindow]? { originals }
+    func capture() -> [SavedWorkWindow]? {
+        captures += 1
+        if captureFailuresRemaining > 0 { captureFailuresRemaining -= 1; return nil }
+        return originals
+    }
     func desktopAvailable(_ desktop: WindowDesktop) -> Bool { !missingDisplays.contains(desktop.display) }
     func read(_ id: WorkWindowID) -> WorkWindowRead {
-        if unreadable.contains(id) { return .unavailable }
+        if unreadable.contains(id) { return .unavailable("mock AX unavailable") }
         return current[id].map(WorkWindowRead.window) ?? .closed
     }
     func move(_ id: WorkWindowID, to point: CGPoint) -> Bool {
@@ -67,10 +73,10 @@ private final class Windows: WorkWindowAccess {
 }
 
 private func run(_ session: WorkWindowSession, _ windows: Windows, _ goal: WorkWindowSession.Goal) -> WorkWindowSession.Progress {
-    for _ in 0..<20 {
-        let result = session.advance(goal)
+    for tick in 0..<100 {
+        let result = session.advance(goal, now: Double(tick) * 0.35)
         windows.settle()
-        if result != .pending { return result }
+        if result != .pending && result != .waitingForMetadata { return result }
     }
     fatalError("unbounded window convergence")
 }
@@ -178,6 +184,72 @@ private func run(_ session: WorkWindowSession, _ windows: Windows, _ goal: WorkW
             expect(run(session, windows, .restore) == .failed([1]), "system-changed special state must be reported, never silently verified")
             expect(windows.writes.isEmpty, "never force original minimized/fullscreen state")
         }
-        print("PASS: 10 window-session groups (no live application or display writes)")
+        do {
+            let windows = Windows([frames[0]])
+            windows.captureFailuresRemaining = 2
+            let session = WorkWindowSession(access: windows, retryDelay: {})
+            expect(session?.windows.count == 1 && session?.captureAttempts == 3, "transient AX failures must re-capture a complete fresh baseline before topology changes")
+            expect(windows.captures == 3 && windows.writes.isEmpty, "capture retries must only read")
+        }
+        do {
+            let windows = Windows([frames[0]])
+            windows.captureFailuresRemaining = 10
+            expect(WorkWindowSession(access: windows, retryDelay: {}) == nil, "persistent capture failure must block unsafe session creation")
+            expect(windows.captures == 3 && windows.writes.isEmpty, "capture retry must be bounded and never alter windows")
+        }
+        do {
+            let windows = Windows([frames[1]])
+            let idle = WorkWindowSession(access: windows)!
+            // UU 在设备名识别前改了模式和窗口位置；会话必须沿用已完成的空闲快照。
+            windows.originals[0].state.frame = CGRect(x: -2560, y: 30, width: 2560, height: 1410)
+            windows.remote()
+            let active = idle.forConnection()
+            expect(run(active, windows, .restore) == .complete(verified: 1, skipped: 0), "connection must restore the pre-UU original frame")
+            expect(windows.current[windows.originals[0].id]!.frame == frames[1], "must not capture the transient 2560-wide layout as the original")
+            let next = idle.forConnection()
+            expect(run(next, windows, .restore) == .complete(verified: 1, skipped: 0), "rapid reconnect uses independent restoration progress")
+            expect(windows.captures == 1, "freezing a baseline must not read a later changed scene")
+        }
+        do {
+            let windows = Windows([frames[0]])
+            let session = WorkWindowSession(access: windows)!
+            let id = windows.originals[0].id
+            windows.remote(); windows.unreadable.insert(id)
+            expect(session.advance(.restore, now: 0) == .waitingForMetadata, "unreadable metadata is waiting, not a move failure")
+            expect(session.advance(.restore, now: 10) == .pending, "do not spend movement budget while metadata unavailable")
+            windows.unreadable.remove(id)
+            expect(run(session, windows, .restore) == .complete(verified: 1, skipped: 0), "late metadata must still allow all staged movement attempts")
+        }
+        do {
+            let windows = Windows([frames[1]])
+            let session = WorkWindowSession(access: windows)!
+            windows.missingDisplays.insert("external")
+            expect(session.advance(.restore, now: 0) == .waitingForMetadata, "desktop metadata may lag the recovered CG topology")
+            expect(session.advance(.restore, now: 10) == .pending, "must wait read-only for desktop metadata")
+            expect(windows.writes.isEmpty, "no window moves while desktop assignment is unknown")
+            windows.missingDisplays.remove("external")
+            expect(run(session, windows, .restore) == .complete(verified: 1, skipped: 0), "fresh desktop metadata allows exact verification")
+        }
+        do {
+            let windows = Windows([frames[0]])
+            let session = WorkWindowSession(access: windows)!
+            windows.current[windows.originals[0].id]!.desktop = WindowDesktop(display: "builtin", space: 99, uuid: "different", soleUserSpace: false)
+            windows.ignoreWrites = true
+            expect(run(session, windows, .restore) == .failed([1]), "matching geometry must not conceal a real desktop mismatch")
+            expect(session.mismatchReasons[1]?.contains("geometry=true, desktop=false") == true, "report geometry and desktop failures separately")
+        }
+        do {
+            let windows = Windows([frames[0]])
+            let session = WorkWindowSession(access: windows)!
+            let id = windows.originals[0].id
+            windows.remote(); windows.unreadable.insert(id)
+            expect(session.advance(.restore, now: 0) == .waitingForMetadata, "wait before lock")
+            session.suspendForLockedScreen()
+            windows.unreadable.remove(id)
+            expect(session.advance(.restore, now: 3600) == .pending, "time spent locked must not exhaust window recovery")
+            windows.settle()
+            expect(run(session, windows, .restore) == .complete(verified: 1, skipped: 0), "unlock resumes the same original baseline")
+        }
+        print("PASS: 17 window-session groups (no live application or display writes; bounded capture retries; immutable pre-connection baseline)")
     }
 }

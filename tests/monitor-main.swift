@@ -19,7 +19,7 @@ enum Log { static func info(_ message: String) {} }
             lock.lock(); reads += 1; lock.unlock()
             Thread.sleep(forTimeInterval: 3)
             return ["stale controller"]
-        }, hasOverlay: { overlay })
+        }, hasOverlay: { overlay }, locked: { false })
         monitor.onConnect = { connects += 1 }
         monitor.onDisconnect = { disconnects += 1 }
         monitor.start()
@@ -35,6 +35,18 @@ enum Log { static func info(_ message: String) {} }
         precondition(connects == 1, "过期的 AX 结果不能重新触发连接")
         precondition(pulses >= 30, "AX 读取不能阻塞主线程")
         heartbeat.invalidate()
+        var screenLocked = true
+        var unlockedReads = 0
+        let lockedMonitor = UUMonitor(trusted: { true }, readControllers: { lock.lock(); unlockedReads += 1; lock.unlock(); return [] },
+            hasOverlay: { false }, locked: { screenLocked })
+        lockedMonitor.start()
+        RunLoop.main.run(until: Date().addingTimeInterval(0.7))
+        lock.lock(); let lockedCount = unlockedReads; lock.unlock()
+        precondition(lockedCount == 0, "锁屏期间不能反复访问不可读的 AX 树")
+        screenLocked = false
+        RunLoop.main.run(until: Date().addingTimeInterval(0.7))
+        lock.lock(); let unlockedCount = unlockedReads; lock.unlock()
+        precondition(unlockedCount > 0, "解锁后自动恢复控制端读取")
         print("PASS: blocked AX keeps main thread responsive; no overlapping reads; overlay disconnect; stale result rejected")
     }
 }

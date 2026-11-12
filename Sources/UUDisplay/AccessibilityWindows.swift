@@ -24,9 +24,13 @@ final class AccessibilityWindows: WorkWindowAccess {
         return nil
     }
     private let applications: () -> [NSRunningApplication]
+    private let diagnostics: (String) -> Void
+    private var reportedRefresh: Set<WorkWindowID> = []
 
-    init(applications: @escaping () -> [NSRunningApplication] = { NSWorkspace.shared.runningApplications }) {
+    init(applications: @escaping () -> [NSRunningApplication] = { NSWorkspace.shared.runningApplications },
+         diagnostics: @escaping (String) -> Void = { _ in }) {
         self.applications = applications
+        self.diagnostics = diagnostics
     }
 
     private static func symbol<T>(_ name: String, _ type: T.Type) -> T? {
@@ -35,6 +39,7 @@ final class AccessibilityWindows: WorkWindowAccess {
 
     func capture() -> [SavedWorkWindow]? {
         captureFailure = nil
+        guard !ScreenLock.isLocked else { return fail("Mac is locked; window baseline deferred until unlock") }
         guard AXIsProcessTrusted(), number != nil, connection != nil, displays != nil, spaces != nil else { return fail("AX authorization or native window/desktop query unavailable") }
         handles = [:]
         guard let rows = Self.rows() else { return fail("CG window list unavailable") }
@@ -47,13 +52,17 @@ final class AccessibilityWindows: WorkWindowAccess {
             guard let launch = Self.launchTime(pid) else { return fail("kernel process identity unavailable, pid=\(pid)") }
             let ax = AXUIElementCreateApplication(pid)
             AXUIElementSetMessagingTimeout(ax, 0.2)
-            guard let windows = Self.get(ax, kAXWindowsAttribute) as? [AXUIElement] else { return fail("AX window list unavailable, pid=\(pid)") }
+            var windowList: CFTypeRef?
+            let windowListError = AXUIElementCopyAttributeValue(ax, kAXWindowsAttribute as CFString, &windowList)
+            guard windowListError == .success, let windows = windowList as? [AXUIElement] else {
+                return fail("AX window list unavailable, pid=\(pid), error=\(windowListError.rawValue)")
+            }
             for element in windows {
                 AXUIElementSetMessagingTimeout(element, 0.2)
                 guard let role = Self.get(element, kAXRoleAttribute) as? String else {
                     return fail("window role unavailable, pid=\(pid)")
                 }
-                if role == kAXScrollAreaRole { continue } // Finder 桌面不是工作窗口。
+                if role == kAXScrollAreaRole || role == kAXHelpTagRole { continue } // 桌面/提示气泡不是工作窗口。
                 guard role == kAXWindowRole else { return fail("unexpected AXWindows role=\(role), pid=\(pid)") }
                 guard let subrole = Self.get(element, kAXSubroleAttribute) as? String else {
                     return fail("window subrole unavailable, pid=\(pid)")
@@ -83,28 +92,64 @@ final class AccessibilityWindows: WorkWindowAccess {
         return saved
     }
 
-    func read(_ id: WorkWindowID) -> WorkWindowRead {
+    func read(_ id: WorkWindowID) -> WorkWindowRead { read(id, mayRefresh: true) }
+
+    private func read(_ id: WorkWindowID, mayRefresh: Bool) -> WorkWindowRead {
         guard let h = handles[id], !h.app.isTerminated,
               let live = NSRunningApplication(processIdentifier: id.pid), !live.isTerminated,
               Self.launchTime(id.pid) == id.launch else { return .closed }
-        guard let rows = Self.rows() else { return .unavailable }
+        guard let rows = Self.rows() else { return .unavailable("CG window list unavailable") }
         guard let row = rows.first(where: {
             ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == id.number &&
             ($0[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == id.pid
         }) else { return .closed }
+        guard !ScreenLock.isLocked else { return .unavailable("Mac is locked") }
+        guard AXIsProcessTrusted() else { return .unavailable("Accessibility authorization unavailable") }
         var actual: CGWindowID = 0
-        guard number?(h.element, &actual) == .success, actual == id.number else { return .unavailable }
+        let numberError = number?(h.element, &actual) ?? .notImplemented
+        guard numberError == .success, actual == id.number else {
+            let reason = "AX window identity unreadable, error=\(numberError.rawValue), actual=\(actual)"
+            if mayRefresh, refreshHandle(id, reason: reason) { return read(id, mayRefresh: false) }
+            return .unavailable(reason)
+        }
         let keys = [kAXMinimizedAttribute, "AXFullScreen"]
         var result: CFArray?
-        guard AXUIElementCopyMultipleAttributeValues(h.element, keys as CFArray,
-                AXCopyMultipleAttributeOptions(rawValue: 0), &result) == .success,
-              let values = result as? [Any], values.count == 2,
-              let minimized = values[0] as? Bool, let fullscreen = values[1] as? Bool,
-              let bounds = row[kCGWindowBounds as String] as? [String: Any],
-              let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary) else { return .unavailable }
-        // 几何以 WindowServer 的实际边界为准；AX 负责身份、特殊状态和写入。
-        guard frame.minX.isFinite, frame.minY.isFinite, frame.width.isFinite, frame.height.isFinite else { return .unavailable }
+        let stateError = AXUIElementCopyMultipleAttributeValues(h.element, keys as CFArray,
+            AXCopyMultipleAttributeOptions(rawValue: 0), &result)
+        guard stateError == .success, let values = result as? [Any], values.count == 2,
+              let minimized = values[0] as? Bool, let fullscreen = values[1] as? Bool else {
+            let attributes = (result as? [Any] ?? []).map(Self.attributeStatus)
+            let reason = "AX minimized/fullscreen metadata unreadable, error=\(stateError.rawValue), attributes=\(attributes)"
+            if mayRefresh, refreshHandle(id, reason: reason) { return read(id, mayRefresh: false) }
+            return .unavailable(reason)
+        }
+        guard let bounds = row[kCGWindowBounds as String] as? [String: Any],
+              let frame = CGRect(dictionaryRepresentation: bounds as CFDictionary),
+              frame.minX.isFinite, frame.minY.isFinite, frame.width.isFinite, frame.height.isFinite else {
+            return .unavailable("CG window geometry unavailable")
+        }
         return .window(WorkWindowState(frame: frame, minimized: minimized, fullscreen: fullscreen, desktop: desktop(id.number)))
+    }
+
+    /// 旧 AX 引用不可读时，只重取同一启动实例、同一 CGWindowID 的引用；不重新采纳几何或按标题匹配。
+    private func refreshHandle(_ id: WorkWindowID, reason: String) -> Bool {
+        guard Self.launchTime(id.pid) == id.launch,
+              let live = NSRunningApplication(processIdentifier: id.pid), !live.isTerminated else { return false }
+        let app = AXUIElementCreateApplication(id.pid)
+        AXUIElementSetMessagingTimeout(app, 0.2)
+        guard let windows = Self.get(app, kAXWindowsAttribute) as? [AXUIElement] else { return false }
+        for element in windows {
+            AXUIElementSetMessagingTimeout(element, 0.2)
+            var actual: CGWindowID = 0
+            if number?(element, &actual) == .success, actual == id.number {
+                handles[id] = Handle(app: live, element: element)
+                if reportedRefresh.insert(id).inserted {
+                    diagnostics("窗口 #\(id.number) 已按原进程启动时间和同一窗口 ID 重新读取 AX 引用；\(reason)")
+                }
+                return true
+            }
+        }
+        return false
     }
 
     func move(_ id: WorkWindowID, to point: CGPoint) -> Bool {
@@ -121,9 +166,10 @@ final class AccessibilityWindows: WorkWindowAccess {
 
     private func set(_ id: WorkWindowID, _ name: String, _ value: AXValue) -> Bool {
         // 写前再次核对原实例及特殊状态，不激活/raise，不修改最小化或全屏标志。
+        guard !ScreenLock.isLocked else { return false }
         guard case .window(let now) = read(id), !now.minimized, !now.fullscreen,
               let h = handles[id] else { return false }
-        return AXUIElementSetAttributeValue(h.element, name as CFString, value) == .success
+        return !ScreenLock.isLocked && AXUIElementSetAttributeValue(h.element, name as CFString, value) == .success
     }
 
     private func desktop(_ id: UInt32) -> WindowDesktop? {
@@ -155,6 +201,15 @@ final class AccessibilityWindows: WorkWindowAccess {
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)
         guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
         return Date(timeIntervalSince1970: Double(info.pbi_start_tvsec) + Double(info.pbi_start_tvusec) / 1_000_000)
+    }
+
+    private static func attributeStatus(_ value: Any) -> String {
+        guard CFGetTypeID(value as CFTypeRef) == AXValueGetTypeID() else { return String(describing: type(of: value)) }
+        let ax = value as! AXValue
+        guard AXValueGetType(ax) == .axError else { return "unexpected AXValue" }
+        var error = AXError.success
+        guard AXValueGetValue(ax, .axError, &error) else { return "unknown AX attribute error" }
+        return "AXError=\(error.rawValue)"
     }
 
     private static func spaceID(_ value: [String: Any]) -> UInt64? {

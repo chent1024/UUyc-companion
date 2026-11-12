@@ -143,11 +143,11 @@ enum PhysicalDisplays {
         }
     }
 
-    /// 按记录重新启用物理屏；成功后删除记录。可在任意进程调用，重复调用无害
+    /// 按记录重新启用物理屏；保留原始 CGError，让调用方区分超时和等待启用。
     @discardableResult
-    static func restore(reason: String) -> Bool {
-        guard let ids = pending else { return true }
-        guard let setEnabled else { return false }
+    static func restore(reason: String) -> CGError {
+        guard let ids = pending else { return .success }
+        guard let setEnabled else { return .failure }
         let err = applyDisplayConfig { cfg in
             for id in ids where CGDisplayIsActive(id) == 0 {
                 let err = setEnabled(cfg, id, true); if err != .success { return err }
@@ -156,13 +156,13 @@ enum PhysicalDisplays {
         }
         if err == .success, clearResolvedRecord() {
             Log.info("✅ 已恢复物理屏 \(ids)（\(reason)）")
-            return true
+            return err
         }
         if err == .success {
             Log.info("已提交物理屏 \(ids) 恢复，等待启用及身份核验（\(reason)）")
-            return false
+            return err
         }
-        Log.info("⚠️ 恢复物理屏失败 CGError=\(err.rawValue)（\(reason)），稍后重试")
-        return false
+        Log.info("⚠️ 恢复物理屏失败 CGError=\(err.rawValue)（\(reason)），保留恢复记录")
+        return err
     }
 }

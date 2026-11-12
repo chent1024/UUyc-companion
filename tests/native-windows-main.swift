@@ -42,6 +42,10 @@ import ApplicationServices
             withExtendedLifetime(windows) { app.run() }
             return
         }
+        guard !ScreenLock.isLocked else {
+            fputs("Native window test unavailable: Mac is locked; no test windows were opened.\n", stderr)
+            exit(77)
+        }
         guard AXIsProcessTrusted() else {
             fputs("Native window test unavailable: test runner has no Accessibility grant; no permission was requested.\n", stderr)
             exit(77)
@@ -109,7 +113,7 @@ import ApplicationServices
         for _ in 0..<20 {
             let result = session.advance(.restore)
             switch result {
-            case .pending: Thread.sleep(forTimeInterval: 0.35)
+            case .pending, .waitingForMetadata: Thread.sleep(forTimeInterval: 0.35)
             case .complete(let verified, let skipped):
                 guard verified == 2, skipped == 1 else { throw Failure.failed("unexpected native counts") }
                 for saved in session.windows where saved.state.minimized {

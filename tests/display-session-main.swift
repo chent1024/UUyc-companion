@@ -8,6 +8,12 @@ import Foundation
         let captured = DisplaySession.capture()!
         precondition(!captured.displays.isEmpty, "须有可读取模式的物理屏")
         precondition(captured.verified())
+        precondition(captured.modesAvailable(), "当前物理屏的原模式必须可读取，不写显示配置")
+        var reordered = captured; reordered.displays.reverse()
+        precondition(captured.sameConfiguration(as: reordered))
+        var changedDuringCapture = captured; changedDuringCapture.displays[0].mode.refreshRate += 1
+        precondition(!captured.sameConfiguration(as: changedDuringCapture), "UU 临时换模式期间不能提交新的窗口/物理屏配对基线")
+        DisplayRecoveryTests.run(captured)
         let redmi = DeviceConfig(name: "Redmi22081212C", kind: .phone, width: 488, height: 1084)
         // 2026-11-06 实机 #7：在线、active、已设主屏，但当前模式和可用模式均为空。
         var readiness = VirtualDisplayReadiness(online: true, active: true, mode: nil)

@@ -79,6 +79,10 @@ struct DisplaySession: Codable {
         try JSONEncoder().encode(self).write(to: url, options: .atomic)
     }
 
+    func sameConfiguration(as other: DisplaySession) -> Bool {
+        displays.sorted { $0.uuid < $1.uuid } == other.displays.sorted { $0.uuid < $1.uuid }
+    }
+
     static func load(from url: URL = Self.url) throws -> DisplaySession {
         let session = try JSONDecoder().decode(Self.self, from: Data(contentsOf: url))
         guard session.version == 1, !session.displays.isEmpty,
@@ -116,8 +120,19 @@ struct DisplaySession: Codable {
         return missing.isEmpty ? nil : DisplaySession(displays: missing)
     }
 
+    /// 释放虚拟屏并等热插拔稳定后，再读当前模式列表；缺席屏留记录，不用别的模式替代。
+    func modesAvailable() -> Bool {
+        let ids = Self.online()
+        return displays.allSatisfy { saved in
+            guard let id = ids.first(where: { Self.uuid($0) == saved.uuid }) else { return true }
+            let modes = CGDisplayCopyAllDisplayModes(id,
+                [kCGDisplayShowDuplicateLowResolutionModes: true] as CFDictionary) as? [CGDisplayMode] ?? []
+            return saved.mode.resolve(in: modes) != nil
+        }
+    }
+
     /// 必须在配置队列执行。已有正确配置时不提交空事务。
-    func restore(includeLayout: Bool = true, retaining virtualIDs: [CGDirectDisplayID] = []) -> CGError {
+    func restore(includeLayout: Bool = true) -> CGError {
         if verified(includeLayout: includeLayout) { return .success }
         let ids = Self.online()
         var targets: [(SavedDisplay, CGDirectDisplayID, CGDisplayMode)] = []
@@ -148,18 +163,6 @@ struct DisplaySession: Codable {
             for (saved, id, _) in targets where saved.mirror == nil {
                 let err = CGConfigureDisplayOrigin(cfg, id, saved.x, saved.y)
                 if err != .success { return err }
-            }
-            // 虚拟屏仍存活时先交还原主屏，避免释放主屏后立即向变动中的拓扑提交事务。
-            if let edge = targets.filter({ $0.0.mirror == nil }).max(by: {
-                Int($0.0.x) + $0.0.mode.width < Int($1.0.x) + $1.0.mode.width
-            }) {
-                var right = Int64(edge.0.x) + Int64(edge.0.mode.width)
-                for id in virtualIDs where ids.contains(id) {
-                    guard right <= Int64(Int32.max) else { return .rangeCheck }
-                    let err = CGConfigureDisplayOrigin(cfg, id, Int32(right), edge.0.y)
-                    if err != .success { return err }
-                    right += Int64(CGDisplayBounds(id).width)
-                }
             }
             return .success
         }
